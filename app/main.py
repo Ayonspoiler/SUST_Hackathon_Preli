@@ -1,11 +1,2 @@
-from fastapi import FastAPI
-
-app = FastAPI()
-
-@app.get("/")
-def home():
-    return {"message": "Hello FastAPI!"}
-
-@app.get("/about")
-def about():
-    return {"message": "This is  FastAPI project."}
+# Entry point is the root main.py — run with: uvicorn main:app
+# This file is kept for compatibility but is not used.
