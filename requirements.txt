@@ -3,5 +3,4 @@ uvicorn[standard]>=0.29
 pydantic>=2.6
 python-dotenv>=1.0
 gunicorn>=21.0
-# --- Optional LLM/hybrid path — uncomment if you set ANTHROPIC_API_KEY ---
-# anthropic>=0.30
+google-genai>=1.0   # optional — only used when ENABLE_LLM_POLISH=true

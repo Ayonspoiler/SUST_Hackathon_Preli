@@ -9,5 +9,5 @@ def setup_logging() -> None:
         stream=sys.stdout,
     )
     # Suppress noisy library logs
-    for lib in ("httpx", "httpcore", "anthropic"):
+    for lib in ("httpx", "httpcore", "google_genai", "google.genai"):
         logging.getLogger(lib).setLevel(logging.WARNING)

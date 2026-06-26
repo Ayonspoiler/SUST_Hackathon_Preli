@@ -1,104 +1,165 @@
 # QueueStorm Investigator
 
-Internal support copilot for a digital finance platform. Reads a customer complaint
-**plus** the customer's recent transaction history, decides what actually happened,
-routes the case to the right department, and drafts a safe reply.
+Internal support copilot for a digital finance platform (SUST CSE Carnival 2026 — Codex Community Hackathon, Online Preliminary).
 
-Built for **SUST CSE Carnival 2026 — Codex Community Hackathon**, Online Preliminary.
+Given one customer **complaint** and recent **transaction history**, the service investigates what actually happened, returns structured routing/classification JSON, and drafts safe agent and customer text.
 
 ## Endpoints
 
 | Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Returns `{"status": "ok"}` — ready within 60s of start |
-| `POST` | `/analyze-ticket` | Structured analysis (see schema below) |
+|--------|------|-------------|
+| `GET` | `/health` | Returns `{"status": "ok"}` (ready within 60s of start) |
+| `POST` | `/analyze-ticket` | Full ticket analysis (request/response schema per problem statement) |
 
-## Tech Stack
+## Quick Start
 
-Python 3.11 · FastAPI · Uvicorn · Gunicorn · Pydantic v2 · python-dotenv
+```bash
+python -m venv venv
+venv\Scripts\activate          # Windows
+# source venv/bin/activate     # Linux/macOS
 
-Optional: Anthropic SDK (for LLM reply polishing — not required for full scoring)
+pip install -r requirements.txt
+copy .env.example .env           # optional — not required for default mode
 
-## AI Approach
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
 
-A deterministic **rule-based investigator** is the core:
+Verify:
 
-1. **Classify** `case_type` from complaint keywords (English + Banglish + Bangla) plus
-   `user_type` / `channel` hints. Phishing detection requires an explicit scam keyword
-   *or* a credential mention (OTP/PIN) paired with a social-engineering cue — so benign
-   mentions like "I forgot my PIN" are not misrouted.
+```bash
+curl http://localhost:8000/health
+curl -X POST http://localhost:8000/analyze-ticket -H "Content-Type: application/json" -d @sample_input.json
+```
 
-2. **Match** the relevant transaction by amount (Bangla numerals normalised), counterparty
-   phone, and transaction type.
+Production-style (Docker / VM):
 
-3. **Decide** `evidence_verdict`:
-   - `consistent` — the matched transaction supports the complaint.
-   - `inconsistent` — data contradicts the complaint (e.g. "wrong transfer" to a
-     counterparty the customer has paid repeatedly; a "failed" payment that actually
-     completed).
-   - `insufficient_data` — empty history, no match, or ≥2 plausible transactions where
-     guessing would risk the wrong dispute.
+```bash
+gunicorn main:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 60
+```
 
-4. **Route** to department and **assess** severity deterministically.
+See [RUNBOOK.md](RUNBOOK.md) for Docker, deployment, and validation steps.
 
-5. **Escalate** for human review on disputes, fraud, and ambiguous cases.
+## Architecture (Hybrid)
 
-6. **Generate** `agent_summary`, `recommended_next_action`, and a language-aware
-   `customer_reply` from safe templates, then run every text field through the safety
-   sanitizer. Optionally polish text via LLM if `ANTHROPIC_API_KEY` is set.
+```
+POST /analyze-ticket
+  → safety pre-scan (injection detection)
+  → deterministic rule engine     ← all scored fields (case_type, verdict, txn id, severity, …)
+  → safe text templates           ← agent_summary, customer_reply, recommended_next_action
+  → optional Gemini text polish   ← OFF by default (ENABLE_LLM_POLISH=false)
+  → safety post-filter            ← always runs on all text fields
+  → JSON response
+```
 
-This service is a copilot, not an autonomous decision-maker: it never confirms a refund
-it cannot authorise and escalates ambiguous/high-risk cases.
+**Design choice:** Rules decide **facts** (35% evidence-reasoning score). The LLM, when enabled, only rewrites text — never changes enum fields. Default deployment is **fully rule-based** (~5 ms per request, no external API dependency).
+
+### Pipeline modules
+
+| Module | Role |
+|--------|------|
+| `app/services/reasoning_engine.py` | Classify, match transactions, verdict, severity, department, human review |
+| `app/services/analyzer.py` | Orchestrates the full pipeline |
+| `app/services/llm_service.py` | Safe templates + optional Gemini polish |
+| `app/services/safety_guard.py` | Pre/post safety filters |
+| `app/routes/analyze.py` | HTTP handler, timeouts, error responses |
+
+## AI / Model Usage
+
+| Component | Default | Purpose |
+|-----------|---------|---------|
+| **Rule engine** | Always on | Evidence reasoning, classification, routing — local CPU, deterministic |
+| **Gemini 2.5 Flash** | Optional (`ENABLE_LLM_POLISH=true`) | Rewrites the 3 text fields only; 4s timeout; falls back to templates on failure |
+
+No GPU. No model weights in the image. Judging does **not** require an API key when polish is disabled.
+
+### MODELS
+
+| Model | Where it runs | Why |
+|-------|---------------|-----|
+| **None (rules + templates)** | Local CPU | Primary path. Fast, free, reliable for automated scoring. |
+| **gemini-2.5-flash** *(optional)* | Google AI API | Text polish only. `THINKING_BUDGET=0` for low latency. Team supplies own `GEMINI_API_KEY`. |
 
 ## Safety Logic
 
-- Never asks for PIN/OTP/password/card — enforced by safe templates **and** a
-  sentence-level sanitiser that distinguishes a request ("share your OTP") from a
-  warning ("do **not** share your OTP").
-- Never confirms a refund/reversal/unblock; uses
-  *"any eligible amount will be returned through official channels."*
-- Never directs customers to third parties or raw URLs — only official channels.
-- Prompt injection: the complaint is treated purely as **data** (keyword scan), never
-  executed. The sanitiser runs on every output field including any LLM output.
+- **Never** asks for PIN, OTP, password, or card number in any output field.
+- **Never** confirms refund, reversal, account unblock, or recovery — uses *"any eligible amount will be returned through official channels"*.
+- **Never** directs customers to third-party phone numbers or URLs.
+- **Prompt injection** in complaints is treated as untrusted data; output is always post-filtered.
+- Safe credential mentions (e.g. *"I know I should not share my PIN"*) are not misclassified as phishing.
 
-## Evidence Reasoning — Validated
+## Response Schema (summary)
 
-The engine reproduces all 10 public sample cases on the scored key fields
-(`relevant_transaction_id`, `evidence_verdict`, `case_type`, `department`, `severity`,
-`human_review_required`). Run `python tests/test_samples.py` to reproduce.
+Required fields: `ticket_id`, `relevant_transaction_id`, `evidence_verdict`, `case_type`, `severity`, `department`, `agent_summary`, `recommended_next_action`, `customer_reply`, `human_review_required`.
 
-## MODELS
+Optional: `confidence`, `reason_codes`.
 
-| Model | Where | Why |
-|---|---|---|
-| **None (rule-based core)** | Local CPU | Deterministic, free, sub-ms per request. Scores the 35% evidence-reasoning category without any API dependency. |
-| **claude-haiku-4-5-20251001** *(optional)* | Anthropic API | Used only to polish `agent_summary` / `customer_reply` text. Call is time-bounded (20s) and falls back to templates on any error, so judging never depends on it. Cost: pay-per-token on own key. |
-
-## Performance
-
-No model loaded at startup → `/health` is instant. Rule-based reasoning is well under
-the 30s limit. Bad input returns 400/422/500 and never crashes the process.
+Enums must match the problem statement exactly (`wrong_transfer`, `payment_failed`, `consistent`, `fraud_risk`, etc.).
 
 ## HTTP Status Codes
 
-| Code | Meaning |
-|---|---|
-| 200 | Valid analysis |
-| 400 | Malformed JSON / missing required fields |
-| 422 | Valid schema but empty `complaint` |
-| 500 | Internal error — no stack traces, no secrets |
+| Code | When |
+|------|------|
+| `200` | Successful analysis |
+| `400` | Malformed JSON or missing required fields (`ticket_id`, `complaint`) |
+| `422` | Empty or whitespace-only `complaint` |
+| `500` | Internal error — no stack traces or secrets in body |
+
+## Environment Variables
+
+Copy `.env.example` to `.env` locally. **Never commit real keys.**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_LLM_POLISH` | `false` | Set `true` to enable optional Gemini text polish |
+| `GEMINI_API_KEY` | *(empty)* | Required only if polish is enabled |
+| `MODEL_NAME` | `gemini-2.5-flash` | Gemini model for polish |
+| `THINKING_BUDGET` | `0` | Keep `0` for sub-5s latency |
+| `LLM_TIMEOUT` | `4.0` | Max seconds for polish call |
+| `REQUEST_TIMEOUT` | `6.0` | Max seconds for full `/analyze-ticket` request |
+
+## Performance
+
+- Default (polish off): **~5 ms** average response time, well under the 30s judge timeout and 5s p95 target.
+- `/health` is instant — no model loaded at startup.
+
+## Sample Files
+
+| File | Purpose |
+|------|---------|
+| `sample_input.json` | Example request (matches public sample case shape) |
+| `sample_output.json` | Example response from this service |
+
+Validate against the official 10-case pack (download from organizers):
+
+```bash
+python tests/test_samples.py SUST_Preli_Sample_Cases.json http://localhost:8000
+```
 
 ## Assumptions
 
-- Bangladeshi mobile-number format for counterparty matching.
-- Amounts in BDT; complaint amounts parsed via regex (Bangla numerals supported).
-- "Other valid responses exist" — we match the key fields plus a safe reply, per the spec.
+- Synthetic data only; Bangladesh mobile format for counterparty matching.
+- Amounts in BDT; Bangla numerals and comma-separated amounts normalized.
+- Multiple valid wordings exist for text fields; judges score key enum/evidence fields.
 
 ## Known Limitations
 
-- Keyword classification can miss unusual phrasings; keyword maps are easy to extend.
-- Free-tier hosting may cold-start; keep `/health` warm during the judging window.
+- Keyword/rule maps may miss novel phrasing not seen in training or local testing.
+- Template replies are safe and professional but not fully custom per ticket unless polish is enabled.
+- Optional Gemini polish adds ~1.5–2s latency and depends on API availability.
+- Free-tier hosts may cold-start; keep `/health` warm during the judging window.
 
-## Run
+## Tech Stack
 
-See [RUNBOOK.md](RUNBOOK.md).
+Python 3.11 · FastAPI · Uvicorn · Gunicorn · Pydantic v2 · python-dotenv · google-genai (optional)
+
+## Submission Checklist
+
+- [ ] Live HTTPS URL with `/health` and `/analyze-ticket` reachable publicly
+- [ ] GitHub repo accessible to organizers (`bipulhf` if private)
+- [ ] No secrets in repository (only `.env.example`)
+- [ ] `ENABLE_LLM_POLISH=false` on production unless you accept latency trade-off
+- [ ] README + RUNBOOK reviewed
+
+## License / Data
+
+Hackathon submission. All transaction and complaint data is synthetic. No real customer or payment data.

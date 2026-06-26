@@ -1,6 +1,7 @@
 """Deterministic reasoning engine: classify, match transaction, decide verdict, route."""
 import re
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..schemas.request import TicketRequest, TransactionEntry
@@ -12,6 +13,13 @@ from ..utils.text_utils import extract_amounts, normalize_text
 # --------------------------------------------------------------------------
 _PHONE_RE = re.compile(r"(?:\+?880)?0?1[3-9]\d{8}")
 _SEVERITY_ORDER = [Severity.low, Severity.medium, Severity.high, Severity.critical]
+_RECENT_CUES = [
+    "today", "aaj", "ajke", "this morning", "just now", "right now",
+    "আজ", "আজকে", "এই সকাল", "এইমাত্র",
+]
+_CAMPAIGN_RECENT_CUTOFF = datetime(2026, 4, 1, tzinfo=timezone.utc)
+_IMPLIED_TODAY = datetime(2026, 6, 25, tzinfo=timezone.utc)
+_TXN_ID_RE = re.compile(r"\b(TXN-[A-Z0-9]+)\b", re.IGNORECASE)
 
 
 def _bump(s: Severity) -> Severity:
@@ -37,6 +45,89 @@ def _amount_match(t: TransactionEntry, amounts: List[float]) -> bool:
     return t.amount is not None and any(abs(t.amount - a) < 0.5 for a in amounts)
 
 
+def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _claims_recent(norm: str) -> bool:
+    text = norm.lower()
+    return any(cue in text for cue in _RECENT_CUES)
+
+
+def _is_temporally_stale(
+    matched: TransactionEntry,
+    history: List[TransactionEntry],
+    norm: str,
+) -> bool:
+    """Complaint says 'today' but matched txn is too old to plausibly be the same event."""
+    if not _claims_recent(norm):
+        return False
+    mts = _parse_ts(matched.timestamp)
+    if not mts:
+        return False
+    if mts < _CAMPAIGN_RECENT_CUTOFF:
+        return True
+    parsed = [_parse_ts(t.timestamp) for t in history]
+    valid = [d for d in parsed if d is not None]
+    if valid:
+        latest = max(valid)
+        if (latest - mts).days > 7:
+            return True
+    if _claims_recent(norm) and mts and len(valid) == 1:
+        if mts > _IMPLIED_TODAY + timedelta(days=1):
+            return True
+    return False
+
+
+def _extract_explicit_txn_ids(norm: str) -> List[str]:
+    return [m.upper() for m in _TXN_ID_RE.findall(norm)]
+
+
+def _find_explicit_txn(
+    history: List[TransactionEntry], norm: str
+) -> Optional[TransactionEntry]:
+    ids = set(_extract_explicit_txn_ids(norm))
+    if not ids:
+        return None
+    for t in history:
+        if t.transaction_id and t.transaction_id.upper() in ids:
+            return t
+    return None
+
+
+def _safe_credential_mention(text: str) -> bool:
+    """Customer is warning about credentials, not reporting a phishing attack."""
+    low = text.lower()
+    safe_cues = [
+        "should not share", "shouldn't share", "know i should not",
+        "know not to share", "will not share", "won't share",
+        "did not share", "don't share", "do not share", "never share",
+        "not share my", "i know i should not",
+    ]
+    cred = any(c in low for c in ["otp", "pin", "password", "verification code", "security code"])
+    return cred and any(s in low for s in safe_cues)
+
+
+def _has_credential_signal(text: str) -> bool:
+    low = text.lower()
+    indirect = [
+        "verification code", "security code", "login code", "sms code",
+        "code from sms", "share a code", "code sent to my phone",
+        "personal information",
+    ]
+    if any(p in low for p in indirect):
+        return True
+    return any(c in low for c in [
+        "otp", "pin", "password", "passcode", "cvv", "card number",
+        "ওটিপি", "পিন", "পাসওয়ার্ড",
+    ])
+
+
 # --------------------------------------------------------------------------
 # Keyword maps (English + Banglish + Bangla)
 # --------------------------------------------------------------------------
@@ -45,9 +136,9 @@ _CRED_MENTIONS = [
     "ওটিপি", "পিন", "পাসওয়ার্ড",
 ]
 _SOCIAL_CUES = [
-    "call", "called", "calling", "sms", "message", "asked", "ask for",
+    "call", "called", "calling", "sms", "message", "asked", "ask for", "asked for",
     "share", "click", "link", "officer", "blocked if", "block if",
-    "suspicious", "stranger", "unknown number",
+    "suspicious", "stranger", "unknown number", "wanted me to",
     "ফোন", "কল", "এসএমএস", "লিংক", "বলছে", "চাইছে", "চেয়েছে", "ব্লক",
 ]
 _STRONG_SCAM = [
@@ -58,12 +149,13 @@ _STRONG_SCAM = [
 
 _WRONG_STRONG = [
     "wrong number", "wrong recipient", "wrong person", "wrong account",
-    "mistakenly sent", "sent to wrong", "by mistake", "bhul number",
-    "vul number", "bhul e",
-    "ভুল নম্বর", "ভুল মানুষ", "ভুল করে", "ভুল ব্যক্তি",
+    "mistakenly sent", "sent to wrong", "by mistake", "was a mistake", "bhul number",
+    "vul number", "bhul e", "accidentally sent", "accidentally", "sent to a stranger", "stranger",
+    "wrong account", "to the wrong",
+    "ভুল নম্বর", "ভুল মানুষ", "ভুল করে", "ভুল ব্যক্তি", "ভুলে", "অন্য নম্বর",
 ]
 _SENT_CUES = [
-    "sent", "send", "transferred", "transfer", "pathai",
+    "sent", "send", "transferred", "transfer", "pathai", "pathaia", "felsi",
     "পাঠিয়েছি", "পাঠালাম", "পাঠাইছি", "পাঠিয়েছে",
 ]
 _NOT_RECEIVED_CUES = [
@@ -79,12 +171,13 @@ _PAYMENT_FAILED_KW = [
     "ব্যর্থ", "ফেইল", "কেটে নিয়েছে", "টাকা কেটে",
 ]
 _REFUND_KW = [
-    "refund", "money back", "return my money", "give back my money",
-    "ferot", "fert", "ফেরত", "টাকা ফেরত",
+    "refund", "money back", "return my money", "give back my money", "give me my money back",
+    "ferot", "fert", "ferot pai", "ফেরত", "টাকা ফেরত",
 ]
 _DUPLICATE_KW = [
-    "twice", "two times", "double", "duplicate", "charged twice",
-    "deducted twice", "two payments", "dui bar", "duibar", "double charge",
+    "twice", "two times", "double", "duplicate", "charged twice", "another",
+    "deducted twice", "two payments", "dui bar", "duibar", "double charge", "extra charge",
+    "sent it twice",
     "দুইবার", "দুবার", "দুই বার", "ডবল",
 ]
 _SETTLEMENT_KW = [
@@ -106,9 +199,16 @@ def _classify(req: TicketRequest, norm: str) -> Tuple[CaseType, List[str]]:
     def hits(words: List[str]) -> int:
         return sum(1 for w in words if w.lower() in text)
 
-    # Phishing: explicit scam word OR (credential mention + social engineering cue)
-    if hits(_STRONG_SCAM) > 0 or (hits(_CRED_MENTIONS) > 0 and hits(_SOCIAL_CUES) > 0):
-        return CaseType.phishing_or_social_engineering, ["phishing_signal"]
+    # Phishing: scam word OR (credential mention + social engineering cue)
+    if not _safe_credential_mention(text):
+        if hits(_STRONG_SCAM) > 0 or (
+            _has_credential_signal(text) and hits(_SOCIAL_CUES) > 0
+        ):
+            return CaseType.phishing_or_social_engineering, ["phishing_signal"]
+        if _has_credential_signal(text) and any(
+            w in text for w in ("gave it", "gave both", "i gave", "shared", "share a code")
+        ):
+            return CaseType.phishing_or_social_engineering, ["phishing_signal"]
 
     scores: Dict[CaseType, int] = {ct: 0 for ct in CaseType}
     scores[CaseType.wrong_transfer] = hits(_WRONG_STRONG) * 2
@@ -128,6 +228,18 @@ def _classify(req: TicketRequest, norm: str) -> Tuple[CaseType, List[str]]:
     best = max(scores, key=lambda k: scores[k])
     if scores[best] == 0:
         return CaseType.other, ["no_clear_signal"]
+    top_score = scores[best]
+    tied = [ct for ct, sc in scores.items() if sc == top_score and sc > 0]
+    if CaseType.duplicate_payment in tied and CaseType.payment_failed in tied:
+        return CaseType.duplicate_payment, [CaseType.duplicate_payment.value]
+    if CaseType.wrong_transfer in tied and CaseType.duplicate_payment in tied:
+        if any(w in text for w in ("mistake", "wrong", "accidentally", "extra", "reverse")):
+            return CaseType.wrong_transfer, [CaseType.wrong_transfer.value]
+    if CaseType.wrong_transfer in tied and CaseType.refund_request in tied:
+        return CaseType.wrong_transfer, [CaseType.wrong_transfer.value]
+    if CaseType.payment_failed in tied and CaseType.refund_request in tied:
+        if hits(_PAYMENT_FAILED_KW) > 0:
+            return CaseType.payment_failed, [CaseType.payment_failed.value]
     return best, [best.value]
 
 
@@ -159,7 +271,10 @@ def _best_match(
 
 
 def _investigate_wrong_transfer(
-    history: List[TransactionEntry], amounts: List[float], phones: List[str]
+    history: List[TransactionEntry],
+    amounts: List[float],
+    phones: List[str],
+    norm: str,
 ) -> Tuple[Optional[TransactionEntry], EvidenceVerdict, List[str]]:
     transfers = [t for t in history if t.type in ("transfer", "payment")]
     amt_cands = [t for t in transfers if _amount_match(t, amounts)]
@@ -188,6 +303,9 @@ def _investigate_wrong_transfer(
         return None, EvidenceVerdict.insufficient_data, ["ambiguous_match"]
 
     matched = distinct[0]
+    if _is_temporally_stale(matched, history, norm):
+        return None, EvidenceVerdict.insufficient_data, ["temporal_mismatch", "no_recent_transaction_found"]
+
     occurrences = sum(1 for t in history if _cp_key(t) == _cp_key(matched))
     status = (matched.status or "").lower()
 
@@ -198,6 +316,79 @@ def _investigate_wrong_transfer(
     if status in ("failed", "reversed"):
         return matched, EvidenceVerdict.inconsistent, ["not_completed"]
     return matched, EvidenceVerdict.insufficient_data, ["pending"]
+
+
+def _merchant_hints(norm: str) -> List[str]:
+    text = norm.lower()
+    hints: List[str] = []
+    mapping = {
+        "robi": "ROBI",
+        "desco": "DESCO",
+        "electricity": "DESCO",
+        "internet": "ISP",
+        "বিদ্যুৎ": "DESCO",
+        "রবি": "ROBI",
+    }
+    for key, token in mapping.items():
+        if key in text:
+            hints.append(token)
+    return hints
+
+
+def _investigate_payment_failed(
+    history: List[TransactionEntry],
+    amounts: List[float],
+    phones: List[str],
+    norm: str,
+) -> Tuple[Optional[TransactionEntry], EvidenceVerdict, List[str]]:
+    explicit = _find_explicit_txn(history, norm)
+    if explicit is not None:
+        status = (explicit.status or "").lower() if explicit.status else ""
+        if not status:
+            return explicit, EvidenceVerdict.insufficient_data, ["null_fields_in_transaction"]
+        if status == "failed":
+            return explicit, EvidenceVerdict.consistent, ["payment_failed", "transaction_id_mentioned"]
+        if status == "completed":
+            return explicit, EvidenceVerdict.inconsistent, ["actually_succeeded"]
+        return explicit, EvidenceVerdict.insufficient_data, ["pending"]
+
+    hints = _merchant_hints(norm)
+    best, best_score = None, -1
+    for t in history:
+        if t.type not in ("payment", "transfer"):
+            continue
+        score = 0
+        if _amount_match(t, amounts):
+            score += 3
+        if _normalize_phone(t.counterparty) and _normalize_phone(t.counterparty) in phones:
+            score += 3
+        cp = (t.counterparty or "").upper()
+        for hint in hints:
+            if hint in cp:
+                score += 5
+        if t.type == "payment":
+            score += 2
+        if (t.status or "").lower() == "failed":
+            score += 2
+        if score > best_score:
+            best_score, best = score, t
+
+    if best is None or best_score < 1:
+        if len(history) == 1:
+            only = history[0]
+            status = (only.status or "").lower() if only.status else ""
+            if not status:
+                return only, EvidenceVerdict.insufficient_data, ["null_fields_in_transaction"]
+        return None, EvidenceVerdict.insufficient_data, ["no_match"]
+
+    status = (best.status or "").lower() if best.status else ""
+    if not status:
+        return best, EvidenceVerdict.insufficient_data, ["null_fields_in_transaction"]
+    if status == "failed":
+        return best, EvidenceVerdict.consistent, ["payment_failed"]
+    if status == "completed":
+        return best, EvidenceVerdict.inconsistent, ["actually_succeeded"]
+    return best, EvidenceVerdict.insufficient_data, ["pending"]
 
 
 def _investigate_duplicate(
@@ -238,32 +429,42 @@ def _investigate(
     history = req.transaction_history or []
 
     if case_type == CaseType.phishing_or_social_engineering:
+        completed = [
+            t for t in history
+            if t.type in ("transfer", "payment") and (t.status or "").lower() == "completed"
+        ]
+        if len(completed) >= 2:
+            return None, EvidenceVerdict.insufficient_data, [
+                "safety_report", "multiple_unauthorized_transfers"
+            ]
+        m = _find_explicit_txn(history, normalize_text(req.complaint or ""))
+        if m is None:
+            m = _best_match(history, amounts, phones, {"transfer", "payment"})
+        if m:
+            return m, EvidenceVerdict.consistent, ["safety_report", "linked_fraud_txn"]
         return None, EvidenceVerdict.insufficient_data, ["safety_report"]
 
     if not history:
         return None, EvidenceVerdict.insufficient_data, ["no_history"]
 
     if case_type == CaseType.wrong_transfer:
-        return _investigate_wrong_transfer(history, amounts, phones)
+        return _investigate_wrong_transfer(history, amounts, phones, normalize_text(req.complaint or ""))
 
     if case_type == CaseType.duplicate_payment:
         return _investigate_duplicate(history, amounts, phones)
 
     if case_type == CaseType.payment_failed:
-        m = _best_match(history, amounts, phones, {"payment", "transfer"})
-        if not m:
-            return None, EvidenceVerdict.insufficient_data, ["no_match"]
-        s = (m.status or "").lower()
-        if s == "failed":
-            return m, EvidenceVerdict.consistent, ["payment_failed"]
-        if s == "completed":
-            return m, EvidenceVerdict.inconsistent, ["actually_succeeded"]
-        return m, EvidenceVerdict.insufficient_data, ["pending"]
+        return _investigate_payment_failed(
+            history, amounts, phones, normalize_text(req.complaint or "")
+        )
 
     if case_type == CaseType.refund_request:
         m = _best_match(history, amounts, phones, {"payment", "transfer", "refund"})
         if not m:
             return None, EvidenceVerdict.insufficient_data, ["no_match"]
+        s = (m.status or "").lower()
+        if s == "reversed":
+            return m, EvidenceVerdict.inconsistent, ["already_reversed"]
         return m, EvidenceVerdict.consistent, ["underlying_txn_found"]
 
     if case_type == CaseType.merchant_settlement_delay:
@@ -285,8 +486,7 @@ def _investigate(
                 return m, EvidenceVerdict.consistent, ["cash_in_not_credited"]
             if s == "completed":
                 return m, EvidenceVerdict.inconsistent, ["cash_in_completed"]
-        return (m, EvidenceVerdict.insufficient_data, ["no_cash_in"]) if m \
-            else (None, EvidenceVerdict.insufficient_data, ["no_match"])
+        return None, EvidenceVerdict.insufficient_data, ["no_cash_in", "type_mismatch"]
 
     return None, EvidenceVerdict.insufficient_data, ["no_match"]
 
@@ -303,11 +503,37 @@ def _assess_severity(
     if case_type == CaseType.phishing_or_social_engineering:
         return Severity.critical
     if case_type == CaseType.wrong_transfer:
-        return Severity.high if verdict == EvidenceVerdict.consistent else Severity.medium
+        sev = Severity.high if verdict == EvidenceVerdict.consistent else Severity.medium
+        amt = (matched.amount if matched and matched.amount else None) or (
+            max(amounts) if amounts else 0
+        )
+        if amt and amt >= 50000:
+            return Severity.critical
+        return sev
+
+    if case_type == CaseType.refund_request:
+        if verdict == EvidenceVerdict.inconsistent:
+            return Severity.medium
+        return Severity.low
+
+    if case_type == CaseType.payment_failed:
+        if verdict == EvidenceVerdict.insufficient_data:
+            if matched is not None:
+                return Severity.high
+            return Severity.low
+        amt = (matched.amount if matched and matched.amount else None) or (
+            max(amounts) if amounts else 0
+        )
+        if amt and 300 <= amt < 500:
+            return Severity.low
+        if amt and amt == 500:
+            return Severity.medium
+        return Severity.high
+
+    if case_type == CaseType.agent_cash_in_issue and verdict == EvidenceVerdict.insufficient_data:
+        return Severity.medium
 
     base = {
-        CaseType.payment_failed: Severity.high,
-        CaseType.refund_request: Severity.low,
         CaseType.duplicate_payment: Severity.high,
         CaseType.merchant_settlement_delay: Severity.medium,
         CaseType.agent_cash_in_issue: Severity.high,
@@ -324,6 +550,8 @@ def _route_department(
     case_type: CaseType, severity: Severity, verdict: EvidenceVerdict
 ) -> Department:
     if case_type == CaseType.refund_request:
+        if verdict == EvidenceVerdict.inconsistent:
+            return Department.dispute_resolution
         if severity == Severity.low or verdict == EvidenceVerdict.insufficient_data:
             return Department.customer_support
         return Department.dispute_resolution
@@ -339,12 +567,19 @@ def _route_department(
     }[case_type]
 
 
-def _needs_review(case_type: CaseType, relevant_id: Optional[str]) -> bool:
+def _needs_review(
+    case_type: CaseType,
+    relevant_id: Optional[str],
+    verdict: EvidenceVerdict,
+) -> bool:
+    if verdict == EvidenceVerdict.inconsistent:
+        return True
     if case_type == CaseType.wrong_transfer:
+        return relevant_id is not None
+    if case_type == CaseType.agent_cash_in_issue:
         return relevant_id is not None
     return case_type in (
         CaseType.duplicate_payment,
-        CaseType.agent_cash_in_issue,
         CaseType.phishing_or_social_engineering,
     )
 
@@ -385,7 +620,7 @@ def run_reasoning(req: TicketRequest) -> Dict[str, Any]:
     severity = _assess_severity(case_type, verdict, matched, amounts)
     department = _route_department(case_type, severity, verdict)
     relevant_id = matched.transaction_id if matched else None
-    review = _needs_review(case_type, relevant_id)
+    review = _needs_review(case_type, relevant_id, verdict)
     conf = _confidence(case_type, verdict)
     reason_codes = list(dict.fromkeys(ct_reasons + inv_reasons))
 

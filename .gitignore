@@ -1,19 +1,29 @@
+# Local / organizer docs (keep out of repo)
 claude.md
 instructions.md
 evaluation.md
-venv/
 
-# Python cache and build artifacts
+# Python
+venv/
+.venv/
+env/
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
 
-# Environment and secrets
+# Secrets — never commit
 .env
 .env.*
 !.env.example
 
-# Virtual environments (alternate names)
-.venv/
-env/
+# Local test artifacts (not needed in repo)
+test_results.json
+test_results_*.json
+text.json
+hard_cases.json
+
+# IDE
+.idea/
+.vscode/
+*.swp

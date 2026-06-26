@@ -20,7 +20,7 @@ _REQUEST_VERBS = [
 ]
 _NEG_CUES = [
     "not", "never", "don't", "do not", "dont", "won't", "without", "avoid",
-    "kindly do not", "na ", "না", "কখনো", "শেয়ার করবেন না",
+    "kindly do not", "not to share", "na ", "না", "কখনো", "শেয়ার করবেন না",
 ]
 
 # --------------------------------------------------------------------------
@@ -46,7 +46,30 @@ _THIRD_PARTY_PATTERNS = [
 ]
 _SAFE_CHANNEL = "please use only our official support app or verified helpline"
 
+_SAFE_PIN_EN = "Please do not share your PIN or OTP with anyone."
+_SAFE_PIN_BN = "অনুগ্রহ করে কারো সাথে আপনার পিন বা ওটিপি শেয়ার করবেন না।"
+
 _SENT_SPLIT = re.compile(r"(?<=[.!?।])\s+")
+
+
+def _standardize_pin_warnings(text: str) -> Tuple[str, bool]:
+    """Rewrite any PIN/OTP mention in customer-facing text to the approved warning."""
+    if not re.search(r"\b(pin|otp|password|পিন|ওটিপি)\b", text, re.IGNORECASE):
+        return text, False
+
+    kept: List[str] = []
+    for sentence in _SENT_SPLIT.split(text):
+        if re.search(r"\b(pin|otp|password|পিন|ওটিপি)\b", sentence, re.IGNORECASE):
+            continue
+        if sentence.strip():
+            kept.append(sentence.strip())
+
+    body = " ".join(kept).strip()
+    if body and body[-1] not in ".!?।":
+        body += "."
+    warning = _SAFE_PIN_BN if re.search(r"[\u0980-\u09FF]", text) else _SAFE_PIN_EN
+    merged = f"{body} {warning}".strip() if body else warning
+    return merged, merged != text
 
 
 def _sanitize_credentials(text: str) -> Tuple[str, bool]:
@@ -67,11 +90,35 @@ def _sanitize_credentials(text: str) -> Tuple[str, bool]:
     return " ".join(parts), changed
 
 
-def _sanitize_text(text: str) -> Tuple[str, List[str]]:
+def _strip_credential_sentences(text: str) -> Tuple[str, bool]:
+    """Remove agent-facing sentences that mention sharing PIN/OTP."""
+    kept: List[str] = []
+    changed = False
+    for sentence in _SENT_SPLIT.split(text):
+        low = sentence.lower()
+        if re.search(r"\b(pin|otp|password|পিন|ওটিপি)\b", low) and re.search(
+            r"share|provide|send|give|advise", low
+        ):
+            changed = True
+            continue
+        if sentence.strip():
+            kept.append(sentence.strip())
+    return " ".join(kept).strip(), changed
+
+
+def _sanitize_text(text: str, *, customer_facing: bool = False) -> Tuple[str, List[str]]:
     flags: List[str] = []
     t, cred_changed = _sanitize_credentials(text)
     if cred_changed:
         flags.append("stripped_credential_request")
+    if customer_facing:
+        t, pin_changed = _standardize_pin_warnings(t)
+        if pin_changed:
+            flags.append("standardized_pin_warning")
+    else:
+        t, stripped = _strip_credential_sentences(t)
+        if stripped:
+            flags.append("stripped_admin_credential_sentence")
     for pat in _REFUND_PATTERNS:
         if re.search(pat, t, re.IGNORECASE):
             flags.append("softened_refund_language")
@@ -92,6 +139,20 @@ def pre_scan(complaint: str) -> None:
         logger.warning("Prompt injection pattern detected in complaint (treating as data).")
 
 
+def has_unsafe_credential_language(text: str) -> bool:
+    """Detect credential-request phrasing that must not appear in customer-facing output."""
+    combined = (text or "").lower()
+    for sentence in _SENT_SPLIT.split(combined):
+        if any(n in sentence for n in _NEG_CUES):
+            continue
+        if re.search(
+            r"(please )?(share|provide|send|give|tell|enter) (us )?(your )?(pin|otp|password)",
+            sentence,
+        ):
+            return True
+    return False
+
+
 def post_filter(
     customer_reply: str,
     recommended_next_action: str,
@@ -101,7 +162,7 @@ def post_filter(
     Sanitize the three text fields.
     Returns (customer_reply, recommended_next_action, agent_summary, combined_flags).
     """
-    cr, f1 = _sanitize_text(customer_reply)
+    cr, f1 = _sanitize_text(customer_reply, customer_facing=True)
     na, f2 = _sanitize_text(recommended_next_action)
     ag, f3 = _sanitize_text(agent_summary)
     all_flags = list(dict.fromkeys(f1 + f2 + f3))

@@ -49,3 +49,32 @@ class TicketResponse(BaseModel):
     human_review_required: bool
     confidence: Optional[float] = None
     reason_codes: Optional[List[str]] = None
+
+
+class LLMTextPolish(BaseModel):
+    """Text-only polish output — scored fields come from the rule engine."""
+
+    agent_summary: str
+    recommended_next_action: str
+    customer_reply: str
+
+
+class LLMAnalysis(BaseModel):
+    """Structured output schema the LLM must return.
+
+    `ticket_id` is intentionally excluded — the service echoes the request value
+    itself to guarantee an exact match. Enum-typed fields force the model to emit
+    only allowed values, protecting the schema/enum score.
+    """
+
+    relevant_transaction_id: Optional[str]
+    evidence_verdict: EvidenceVerdict
+    case_type: CaseType
+    severity: Severity
+    department: Department
+    agent_summary: str
+    recommended_next_action: str
+    customer_reply: str
+    human_review_required: bool
+    confidence: float
+    reason_codes: List[str]
