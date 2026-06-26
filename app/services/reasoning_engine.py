@@ -37,6 +37,17 @@ def _amount_match(t: TransactionEntry, amounts: List[float]) -> bool:
     return t.amount is not None and any(abs(t.amount - a) < 0.5 for a in amounts)
 
 
+def _cp_score(counterparty: Optional[str], norm_text: str) -> int:
+    """Return bonus score if any meaningful token from counterparty appears in complaint."""
+    if not counterparty or not norm_text:
+        return 0
+    parts = re.split(r"[-_/\s]", counterparty.lower())
+    for part in parts:
+        if len(part) >= 4 and part in norm_text.lower():
+            return 2
+    return 0
+
+
 # --------------------------------------------------------------------------
 # Keyword maps (English + Banglish + Bangla)
 # --------------------------------------------------------------------------
@@ -47,7 +58,7 @@ _CRED_MENTIONS = [
 _SOCIAL_CUES = [
     "call", "called", "calling", "sms", "message", "asked", "ask for",
     "share", "click", "link", "officer", "blocked if", "block if",
-    "suspicious", "stranger", "unknown number",
+    "suspicious", "unknown number", "impersonat",
     "ফোন", "কল", "এসএমএস", "লিংক", "বলছে", "চাইছে", "চেয়েছে", "ব্লক",
 ]
 _STRONG_SCAM = [
@@ -57,34 +68,51 @@ _STRONG_SCAM = [
 ]
 
 _WRONG_STRONG = [
+    # English
     "wrong number", "wrong recipient", "wrong person", "wrong account",
-    "mistakenly sent", "sent to wrong", "by mistake", "bhul number",
-    "vul number", "bhul e",
+    "wrong bkash", "wrong mobile",
+    "mistakenly sent", "mistakenly transferred",
+    "sent to wrong", "transferred to wrong", "sent by mistake",
+    "sent to the wrong", "transferred to the wrong",
+    "by mistake", "accidentally sent", "accidentally transferred",
+    "to a stranger", "to an unknown", "to wrong person",
+    "to unknown person", "to unknown number",
+    # Banglish
+    "bhul number", "vul number", "bhul e", "bhul nambor",
+    "vul nambor", "galti te", "wrong e pathiye",
+    # Bangla
     "ভুল নম্বর", "ভুল মানুষ", "ভুল করে", "ভুল ব্যক্তি",
+    "ভুলে", "অন্য নম্বর", "অচেনা", "ভুল মানুষে",
+    "ভুল একাউন্ট", "অন্য ব্যক্তি",
 ]
 _SENT_CUES = [
-    "sent", "send", "transferred", "transfer", "pathai",
+    "sent", "send", "transferred", "transfer", "pathai", "diye diyechi",
     "পাঠিয়েছি", "পাঠালাম", "পাঠাইছি", "পাঠিয়েছে",
+    "পাঠিয়ে দিয়েছি", "পাঠিয়ে দিলাম", "দিয়েছি",
 ]
 _NOT_RECEIVED_CUES = [
     "didn't get", "did not get", "didnt get", "didn't receive",
     "did not receive", "not received", "hasn't received",
     "haven't received", "didn't reach", "did not reach",
+    "she did not receive", "he did not receive", "they did not receive",
     "পায়নি", "পাইনি", "পাননি", "পাইনাই", "আসেনি", "আসে নাই", "পৌঁছায়নি",
 ]
 
 _PAYMENT_FAILED_KW = [
     "failed", "transaction failed", "payment failed",
     "did not go through", "didn't go through", "unsuccessful", "showed failed",
-    "ব্যর্থ", "ফেইল", "কেটে নিয়েছে", "টাকা কেটে",
+    "could not", "couldn't", "not successful", "rejected",
+    "balance deducted", "deducted", "money deducted",
+    "ব্যর্থ", "ফেইল", "কেটে নিয়েছে", "টাকা কেটে", "হয়নি",
 ]
 _REFUND_KW = [
     "refund", "money back", "return my money", "give back my money",
-    "ferot", "fert", "ফেরত", "টাকা ফেরত",
+    "get it back", "ferot", "fert", "ফেরত", "টাকা ফেরত",
 ]
 _DUPLICATE_KW = [
     "twice", "two times", "double", "duplicate", "charged twice",
     "deducted twice", "two payments", "dui bar", "duibar", "double charge",
+    "same payment", "charged again", "billed twice",
     "দুইবার", "দুবার", "দুই বার", "ডবল",
 ]
 _SETTLEMENT_KW = [
@@ -111,9 +139,13 @@ def _classify(req: TicketRequest, norm: str) -> Tuple[CaseType, List[str]]:
         return CaseType.phishing_or_social_engineering, ["phishing_signal"]
 
     scores: Dict[CaseType, int] = {ct: 0 for ct in CaseType}
+
+    # Wrong transfer — strong keywords score 2 each
     scores[CaseType.wrong_transfer] = hits(_WRONG_STRONG) * 2
+    # sent + not-received is also a strong wrong-transfer signal
     if hits(_SENT_CUES) > 0 and hits(_NOT_RECEIVED_CUES) > 0:
         scores[CaseType.wrong_transfer] += 2
+
     scores[CaseType.duplicate_payment] = hits(_DUPLICATE_KW) * 2
     scores[CaseType.merchant_settlement_delay] = hits(_SETTLEMENT_KW) * 2
     scores[CaseType.payment_failed] = hits(_PAYMENT_FAILED_KW) * 2
@@ -139,7 +171,20 @@ def _best_match(
     amounts: List[float],
     phones: List[str],
     types: set,
+    norm_text: str = "",
+    prefer_status: str = "",
 ) -> Optional[TransactionEntry]:
+    """
+    Score each transaction and return the best match.
+    Scoring:
+      +3  amount matches complaint
+      +3  counterparty phone matches a phone in complaint
+      +1  transaction type is in expected types set
+      +2  counterparty keyword appears in complaint text
+      +1  transaction status matches prefer_status (tiebreaker)
+    Falls back to the single history entry only when there is at least
+    one signal (amount or phone) linking it to the complaint.
+    """
     best, best_score = None, 0
     for t in history:
         s = 0
@@ -149,17 +194,28 @@ def _best_match(
             s += 3
         if t.type in types:
             s += 1
+        s += _cp_score(t.counterparty, norm_text)
+        if prefer_status and (t.status or "").lower() == prefer_status:
+            s += 1
         if s > best_score:
             best_score, best = s, t
+
     if best_score >= 1:
         return best
-    if len(history) == 1:
+    # Fallback: single entry only when there is a signal to link it
+    if len(history) == 1 and (amounts or phones):
         return history[0]
     return None
 
 
+# --------------------------------------------------------------------------
+# Investigation helpers
+# --------------------------------------------------------------------------
 def _investigate_wrong_transfer(
-    history: List[TransactionEntry], amounts: List[float], phones: List[str]
+    history: List[TransactionEntry],
+    amounts: List[float],
+    phones: List[str],
+    norm_text: str,
 ) -> Tuple[Optional[TransactionEntry], EvidenceVerdict, List[str]]:
     transfers = [t for t in history if t.type in ("transfer", "payment")]
     amt_cands = [t for t in transfers if _amount_match(t, amounts)]
@@ -179,13 +235,24 @@ def _investigate_wrong_transfer(
             distinct.append(t)
 
     if not distinct:
-        if len(history) == 1 and history[0].type in ("transfer", "payment"):
+        # Only use single-entry fallback when there is a signal linking it
+        if len(history) == 1 and history[0].type in ("transfer", "payment") and (amounts or phones):
             distinct = [history[0]]
         else:
             return None, EvidenceVerdict.insufficient_data, ["no_match"]
 
     if len(distinct) >= 2:
-        return None, EvidenceVerdict.insufficient_data, ["ambiguous_match"]
+        # Try counterparty keyword to break the tie
+        scored = [(t, _cp_score(t.counterparty, norm_text)) for t in distinct]
+        top_score = max(s for _, s in scored)
+        if top_score > 0:
+            top = [t for t, s in scored if s == top_score]
+            if len(top) == 1:
+                distinct = top
+            else:
+                return None, EvidenceVerdict.insufficient_data, ["ambiguous_match"]
+        else:
+            return None, EvidenceVerdict.insufficient_data, ["ambiguous_match"]
 
     matched = distinct[0]
     occurrences = sum(1 for t in history if _cp_key(t) == _cp_key(matched))
@@ -201,7 +268,10 @@ def _investigate_wrong_transfer(
 
 
 def _investigate_duplicate(
-    history: List[TransactionEntry], amounts: List[float], phones: List[str]
+    history: List[TransactionEntry],
+    amounts: List[float],
+    phones: List[str],
+    norm_text: str,
 ) -> Tuple[Optional[TransactionEntry], EvidenceVerdict, List[str]]:
     groups: Dict[Any, List[TransactionEntry]] = defaultdict(list)
     for t in history:
@@ -223,7 +293,7 @@ def _investigate_duplicate(
         dup_sorted = sorted(dup, key=lambda t: t.timestamp or "")
         return dup_sorted[-1], EvidenceVerdict.consistent, ["duplicate_confirmed"]
 
-    m = _best_match(history, amounts, phones, {"payment", "transfer"})
+    m = _best_match(history, amounts, phones, {"payment", "transfer"}, norm_text)
     if m:
         return m, EvidenceVerdict.inconsistent, ["single_charge_only"]
     return None, EvidenceVerdict.insufficient_data, ["no_match"]
@@ -234,23 +304,33 @@ def _investigate(
     case_type: CaseType,
     amounts: List[float],
     phones: List[str],
+    norm_text: str,
 ) -> Tuple[Optional[TransactionEntry], EvidenceVerdict, List[str]]:
     history = req.transaction_history or []
 
     if case_type == CaseType.phishing_or_social_engineering:
+        if not history:
+            return None, EvidenceVerdict.insufficient_data, ["safety_report"]
+        # Look for a matching transaction — e.g., an unauthorized transfer that followed OTP theft
+        m = _best_match(history, amounts, phones, {"transfer", "payment"}, norm_text)
+        if m:
+            return m, EvidenceVerdict.consistent, ["linked_transaction_found"]
         return None, EvidenceVerdict.insufficient_data, ["safety_report"]
 
     if not history:
         return None, EvidenceVerdict.insufficient_data, ["no_history"]
 
     if case_type == CaseType.wrong_transfer:
-        return _investigate_wrong_transfer(history, amounts, phones)
+        return _investigate_wrong_transfer(history, amounts, phones, norm_text)
 
     if case_type == CaseType.duplicate_payment:
-        return _investigate_duplicate(history, amounts, phones)
+        return _investigate_duplicate(history, amounts, phones, norm_text)
 
     if case_type == CaseType.payment_failed:
-        m = _best_match(history, amounts, phones, {"payment", "transfer"})
+        m = _best_match(
+            history, amounts, phones, {"payment", "transfer"},
+            norm_text, prefer_status="failed",
+        )
         if not m:
             return None, EvidenceVerdict.insufficient_data, ["no_match"]
         s = (m.status or "").lower()
@@ -261,13 +341,17 @@ def _investigate(
         return m, EvidenceVerdict.insufficient_data, ["pending"]
 
     if case_type == CaseType.refund_request:
-        m = _best_match(history, amounts, phones, {"payment", "transfer", "refund"})
+        m = _best_match(history, amounts, phones, {"payment", "transfer", "refund"}, norm_text)
         if not m:
             return None, EvidenceVerdict.insufficient_data, ["no_match"]
+        s = (m.status or "").lower()
+        if s == "reversed":
+            # Refund may have already been processed
+            return m, EvidenceVerdict.inconsistent, ["already_reversed"]
         return m, EvidenceVerdict.consistent, ["underlying_txn_found"]
 
     if case_type == CaseType.merchant_settlement_delay:
-        m = _best_match(history, amounts, phones, {"settlement", "payment"})
+        m = _best_match(history, amounts, phones, {"settlement", "payment"}, norm_text)
         if m and m.type == "settlement":
             s = (m.status or "").lower()
             if s in ("pending", "failed"):
@@ -278,15 +362,17 @@ def _investigate(
             else (None, EvidenceVerdict.insufficient_data, ["no_match"])
 
     if case_type == CaseType.agent_cash_in_issue:
-        m = _best_match(history, amounts, phones, {"cash_in"})
+        m = _best_match(history, amounts, phones, {"cash_in"}, norm_text)
         if m and m.type == "cash_in":
             s = (m.status or "").lower()
             if s in ("failed", "pending"):
                 return m, EvidenceVerdict.consistent, ["cash_in_not_credited"]
             if s == "completed":
                 return m, EvidenceVerdict.inconsistent, ["cash_in_completed"]
-        return (m, EvidenceVerdict.insufficient_data, ["no_cash_in"]) if m \
-            else (None, EvidenceVerdict.insufficient_data, ["no_match"])
+        # Found a transaction but it's the wrong type (e.g., a transfer instead of cash_in)
+        if m:
+            return None, EvidenceVerdict.insufficient_data, ["type_mismatch"]
+        return None, EvidenceVerdict.insufficient_data, ["no_match"]
 
     return None, EvidenceVerdict.insufficient_data, ["no_match"]
 
@@ -294,6 +380,17 @@ def _investigate(
 # --------------------------------------------------------------------------
 # Severity, department, human review
 # --------------------------------------------------------------------------
+def _amount_tier(amt: float) -> Severity:
+    """Map a BDT amount to a base severity tier."""
+    if amt >= 50000:
+        return Severity.critical
+    if amt >= 2000:
+        return Severity.high
+    if amt >= 500:
+        return Severity.medium
+    return Severity.low
+
+
 def _assess_severity(
     case_type: CaseType,
     verdict: EvidenceVerdict,
@@ -302,22 +399,50 @@ def _assess_severity(
 ) -> Severity:
     if case_type == CaseType.phishing_or_social_engineering:
         return Severity.critical
+
     if case_type == CaseType.wrong_transfer:
-        return Severity.high if verdict == EvidenceVerdict.consistent else Severity.medium
+        sev = Severity.high if verdict == EvidenceVerdict.consistent else Severity.medium
+        amt = (matched.amount if matched else None) or (max(amounts) if amounts else 0)
+        if amt and amt >= 50000:
+            sev = Severity.critical
+        return sev
 
-    base = {
-        CaseType.payment_failed: Severity.high,
-        CaseType.refund_request: Severity.low,
-        CaseType.duplicate_payment: Severity.high,
-        CaseType.merchant_settlement_delay: Severity.medium,
-        CaseType.agent_cash_in_issue: Severity.high,
-        CaseType.other: Severity.low,
-    }.get(case_type, Severity.low)
+    amt = (matched.amount if matched else None) or (max(amounts) if amounts else 0)
 
-    amt = (matched.amount if matched and matched.amount else None) or (max(amounts) if amounts else 0)
-    if amt and amt >= 50000 and base in (Severity.medium, Severity.high):
-        base = _bump(base)
-    return base
+    if case_type == CaseType.payment_failed:
+        base = _amount_tier(amt) if amt else Severity.low
+        return base
+
+    if case_type == CaseType.refund_request:
+        if not amt:
+            return Severity.low
+        if amt >= 50000:
+            return Severity.critical
+        if amt >= 10000:
+            return Severity.high
+        if amt >= 500:
+            return Severity.medium
+        return Severity.low
+
+    if case_type == CaseType.duplicate_payment:
+        base = Severity.high
+        if amt and amt >= 50000:
+            base = Severity.critical
+        return base
+
+    if case_type == CaseType.merchant_settlement_delay:
+        # Inconsistent means platform says settled but merchant disagrees — escalate
+        if verdict == EvidenceVerdict.inconsistent:
+            return Severity.high
+        return Severity.medium
+
+    if case_type == CaseType.agent_cash_in_issue:
+        # Only high when we have confirmed evidence of the issue
+        if verdict == EvidenceVerdict.consistent:
+            return Severity.high
+        return Severity.medium
+
+    return Severity.low  # CaseType.other and fallback
 
 
 def _route_department(
@@ -339,14 +464,32 @@ def _route_department(
     }[case_type]
 
 
-def _needs_review(case_type: CaseType, relevant_id: Optional[str]) -> bool:
-    if case_type == CaseType.wrong_transfer:
+def _needs_review(
+    case_type: CaseType,
+    relevant_id: Optional[str],
+    verdict: EvidenceVerdict,
+) -> bool:
+    # Contradictory evidence always needs a human to reconcile
+    if verdict == EvidenceVerdict.inconsistent:
+        return True
+
+    # Phishing is always a human-escalation case
+    if case_type == CaseType.phishing_or_social_engineering:
+        return True
+
+    # Duplicate payments need verification before any reversal
+    if case_type == CaseType.duplicate_payment:
+        return True
+
+    # Wrong transfers and cash-in issues: only when a transaction is identified
+    if case_type in (CaseType.wrong_transfer, CaseType.agent_cash_in_issue):
         return relevant_id is not None
-    return case_type in (
-        CaseType.duplicate_payment,
-        CaseType.agent_cash_in_issue,
-        CaseType.phishing_or_social_engineering,
-    )
+
+    # Refund requests need review when a transaction is linked
+    if case_type == CaseType.refund_request and relevant_id is not None:
+        return True
+
+    return False
 
 
 def _confidence(
@@ -358,7 +501,7 @@ def _confidence(
         EvidenceVerdict.insufficient_data: 0.62,
     }[verdict]
     if case_type == CaseType.phishing_or_social_engineering:
-        base = 0.95
+        base = max(base, 0.92)
     elif case_type == CaseType.refund_request and verdict == EvidenceVerdict.consistent:
         base = 0.85
     elif case_type == CaseType.other:
@@ -379,13 +522,13 @@ def run_reasoning(req: TicketRequest) -> Dict[str, Any]:
     phones = _extract_phones(req.complaint or "")
 
     case_type, ct_reasons = _classify(req, norm)
-    matched, verdict, inv_reasons = _investigate(req, case_type, amounts, phones)
+    matched, verdict, inv_reasons = _investigate(req, case_type, amounts, phones, norm)
     is_ambiguous = "ambiguous_match" in inv_reasons
 
     severity = _assess_severity(case_type, verdict, matched, amounts)
     department = _route_department(case_type, severity, verdict)
     relevant_id = matched.transaction_id if matched else None
-    review = _needs_review(case_type, relevant_id)
+    review = _needs_review(case_type, relevant_id, verdict)
     conf = _confidence(case_type, verdict)
     reason_codes = list(dict.fromkeys(ct_reasons + inv_reasons))
 
